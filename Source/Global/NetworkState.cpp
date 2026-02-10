@@ -376,19 +376,31 @@ HRESULT CALLBACK NetworkState::CleanupAsyncProvider(XAsyncOp op, const XAsyncPro
     {
     case XAsyncOp::Begin:
     {
-        std::unique_lock<std::mutex> lock{ state->m_mutex };
-        state->m_cleanupAsyncBlock = data->async;
-        bool scheduleCleanup = state->ScheduleCleanup();
-
+        std::vector<XAsyncBlock*> activeRequests;
 #ifndef HC_NOWEBSOCKETS
-        HC_TRACE_VERBOSE(HTTPCLIENT, "NetworkState::CleanupAsyncProvider::Begin: HTTP active=%llu, WebSocket Connecting=%llu, WebSocket Connected=%llu", state->m_activeHttpRequests.size(), state->m_connectingWebSockets.size(), state->m_connectedWebSockets.size());
+        std::vector<ActiveWebSocketContext*> connectedWebSockets;
 #endif
-        for (auto& activeRequest : state->m_activeHttpRequests)
+        bool scheduleCleanup = false;
+        {
+            std::unique_lock<std::mutex> lock{ state->m_mutex };
+            state->m_cleanupAsyncBlock = data->async;
+            scheduleCleanup = state->ScheduleCleanup();
+
+#ifndef HC_NOWEBSOCKETS 
+            HC_TRACE_VERBOSE(HTTPCLIENT, "NetworkState::CleanupAsyncProvider::Begin: HTTP active=%llu, WebSocket Connecting=%llu, WebSocket Connected=%llu", state->m_activeHttpRequests.size(), state->m_connectingWebSockets.size(), state->m_connectedWebSockets.size());
+#endif
+            activeRequests.assign(state->m_activeHttpRequests.begin(), state->m_activeHttpRequests.end());
+#ifndef HC_NOWEBSOCKETS
+            connectedWebSockets.assign(state->m_connectedWebSockets.begin(), state->m_connectedWebSockets.end());
+#endif
+        }
+
+        for (auto& activeRequest : activeRequests)
         {
             XAsyncCancel(activeRequest);
         }
 #ifndef HC_NOWEBSOCKETS
-        for (auto& context : state->m_connectedWebSockets)
+        for (auto& context : connectedWebSockets)
         {
             HRESULT hr = context->websocketObserver->websocket->Disconnect();
             if (FAILED(hr))
@@ -397,7 +409,6 @@ HRESULT CALLBACK NetworkState::CleanupAsyncProvider(XAsyncOp op, const XAsyncPro
             }
         }
 #endif
-        lock.unlock();
 
         if (scheduleCleanup)
         {
