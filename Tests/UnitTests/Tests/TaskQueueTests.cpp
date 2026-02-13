@@ -9,11 +9,6 @@
 
 #define TEST_CLASS_OWNER L"brianpe"
 
-namespace ApiDiag
-{
-    extern std::atomic<uint32_t> g_globalApiRefs;
-}
-
 template <class H, class C>
 class AutoHandleWrapper
 {
@@ -113,31 +108,23 @@ public:
     BEGIN_TEST_CLASS(TaskQueueTests)
     END_TEST_CLASS()
 
-    TEST_CLASS_CLEANUP(ClassCleanup)
+    TEST_METHOD_CLEANUP(TestCleanup)
     {
         //
         // Note: this is a global refcount for tracking
         // leaks in the task queue.  If any other tests fail
         // this may also fail, as those tests could have leaked.
         //
-        uint32_t gr = ApiDiag::g_globalApiRefs;
-        // Only fail if we have a significant leak (more than a few references)
-        // Global persistent objects (like the default process queue) may legitimately
-        // remain allocated between test runs
-        VERIFY_IS_TRUE(gr <= 10);
+        VERIFY_IS_TRUE(XTaskQueueUninitialize(250));
         return true;
     }
 
 #else
     DEFINE_TEST_CLASS_PROPS(TaskQueueTests);
 
-    TEST_CLASS_CLEANUP(ClassCleanup)
+    TEST_METHOD_CLEANUP(TestCleanup)
     {
-        uint32_t gr = ApiDiag::g_globalApiRefs;
-        // Only fail if we have a significant leak (more than a few references)
-        // Global persistent objects (like the default process queue) may legitimately
-        // remain allocated between test runs
-        VERIFY_IS_TRUE(gr <= 10);
+        VERIFY_IS_TRUE(XTaskQueueUninitialize(250));
     }
 
 #endif
@@ -912,7 +899,7 @@ public:
             };
 
             VERIFY_SUCCEEDED(XTaskQueueTerminate(queue, false, evt, termCb));
-            VERIFY_ARE_NOT_EQUAL((DWORD)WAIT_TIMEOUT, WaitForSingleObject(evt, 5000));
+            VERIFY_ARE_EQUAL((DWORD)WAIT_OBJECT_0, WaitForSingleObject(evt, 5000));
             CloseHandle(evt);
         }
 
@@ -938,31 +925,19 @@ public:
     {
         AutoQueueHandle queue;
         VERIFY_IS_TRUE(XTaskQueueGetCurrentProcessTaskQueue(&queue));
-        XTaskQueueHandle globalQueue = queue;
         VERIFY_IS_NOT_NULL(queue);
 
         auto cb = [](void*, bool) {};
 
         VERIFY_SUCCEEDED(XTaskQueueSubmitCallback(queue, XTaskQueuePort::Work, nullptr, cb));
 
-        // The global queue should not be closable or terminatable.
-        XTaskQueueCloseHandle(queue);
-        XTaskQueueCloseHandle(queue);
-        XTaskQueueCloseHandle(queue);
-        XTaskQueueCloseHandle(queue);
-        XTaskQueueCloseHandle(queue);
-
-        VERIFY_SUCCEEDED(XTaskQueueSubmitCallback(queue, XTaskQueuePort::Work, nullptr, cb));
-
-        VERIFY_ARE_EQUAL(E_ACCESSDENIED, XTaskQueueTerminate(queue, false, nullptr, nullptr));
-
         // Now replace the global with our own.
+        AutoQueueHandle globalQueue(queue.Release());
         AutoQueueHandle ourQueue;
         VERIFY_SUCCEEDED(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &ourQueue));
 
         XTaskQueueSetCurrentProcessTaskQueue(ourQueue);
 
-        queue.Close();
         VERIFY_IS_TRUE(XTaskQueueGetCurrentProcessTaskQueue(&queue));
         VERIFY_SUCCEEDED(XTaskQueueSubmitCallback(queue, XTaskQueuePort::Work, nullptr, cb));
         VERIFY_IS_FALSE(XTaskQueueIsEmpty(ourQueue, XTaskQueuePort::Work));
@@ -983,8 +958,20 @@ public:
         AutoQueueHandle globalQueue;
         VERIFY_IS_TRUE(XTaskQueueGetCurrentProcessTaskQueue(&globalQueue));
         VERIFY_IS_NOT_NULL(globalQueue);
-        
-        VERIFY_ARE_EQUAL(E_ACCESSDENIED, XTaskQueueTerminate(globalQueue, true, nullptr, nullptr));
+
+        auto cbEmpty = [](void*, bool) {};
+
+        // Verify the default task queue can be terminated, but can come back if the
+        // runtime is re-initialized.
+        VERIFY_SUCCEEDED(XTaskQueueTerminate(globalQueue, false, nullptr, nullptr));
+        VERIFY_ARE_EQUAL(E_ABORT, XTaskQueueSubmitCallback(globalQueue, XTaskQueuePort::Work, nullptr, cbEmpty));
+
+        globalQueue.Close();
+        VERIFY_IS_TRUE(XTaskQueueUninitialize(0));
+        VERIFY_IS_TRUE(XTaskQueueGetCurrentProcessTaskQueue(&globalQueue));
+        VERIFY_IS_NOT_NULL(globalQueue);
+
+        VERIFY_SUCCEEDED(XTaskQueueSubmitCallback(globalQueue, XTaskQueuePort::Work, nullptr, cbEmpty));
         
         // We should be able to create a composite off of this queue and
         // terminate the composite safely.
@@ -1347,6 +1334,30 @@ public:
         XTaskQueueResumeTermination(queue);
 
         VERIFY_ARE_EQUAL((DWORD)WAIT_OBJECT_0, WaitForSingleObject(waitHandle, 2000));
+    }
+
+    DEFINE_TEST_CASE(VerifyUninitialize)
+    {
+        // Verify the process task queue can be created and does not prevent uninit.
+        AutoQueueHandle globalQueue;
+        VERIFY_IS_TRUE(XTaskQueueGetCurrentProcessTaskQueue(&globalQueue));
+        globalQueue.Close();
+        VERIFY_IS_TRUE(XTaskQueueUninitialize(0));
+
+        // Verify that uninit waits for a queue with active callbacks.
+        AutoQueueHandle queue;
+        VERIFY_SUCCEEDED(XTaskQueueCreate(XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::ThreadPool, &queue));
+
+        VERIFY_SUCCEEDED(XTaskQueueSubmitDelayedCallback(queue, XTaskQueuePort::Work, 500, nullptr, [](void*, bool) {}));
+        queue.Close();
+
+        // Uninitialize should return false because there are outstanding items.
+        VERIFY_IS_FALSE(XTaskQueueUninitialize(0));
+
+        // The queue should be cleaned up shortly after the 500ms item runs.
+        UINT64 start = GetTickCount64();
+        VERIFY_IS_TRUE(XTaskQueueUninitialize(1000));
+        LOG_COMMENT(L"Uninit took %I64u ms", GetTickCount64() - start);
     }
 
 #ifdef SUSPEND_API

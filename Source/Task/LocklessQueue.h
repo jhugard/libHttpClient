@@ -64,26 +64,6 @@ template <typename TData>
 class alignas(8) LocklessQueue
 {
 public:
-    
-    static void* operator new(_In_ size_t sz)
-    {
-        void* ptr = aligned_malloc(sz, 8);
-        if (ptr == nullptr)
-        {
-            throw new std::bad_alloc;
-        }
-        return ptr;
-    }
-    
-    static void* operator new(_In_ size_t sz, _In_ const std::nothrow_t&)
-    {
-        return aligned_malloc(sz, 8);
-    }
-    
-    static void operator delete(_In_ void* ptr)
-    {
-        aligned_free(ptr);
-    }
 
     //
     // Creates a new lockless queue.  The blockSize parameter indicates how many
@@ -384,7 +364,7 @@ private:
     // a payload of type TData. Nodes must be properly aligned
     // in memory so std::atomic works consistently.  We do this
     // by using an aligned allocator.
-    struct Node
+    struct alignas(8) Node
     {
         std::atomic<Address> next;
         TData data;
@@ -397,7 +377,7 @@ private:
     // Blocks are linked together as a singly linked list.
     // Blocks must be properly aligned in memory so std::atomic
     // works consistently.  We do this by using an aligned allocator.
-    struct Block
+    struct alignas(8) Block
     {
         std::atomic<Block*> next;
         Node* nodes;
@@ -568,13 +548,8 @@ private:
             {
                 Block* d = block;
                 block = block->next;
-
-                for (uint32_t idx = 0; idx < m_blockSize; idx++)
-                {
-                    d->nodes[idx].~Node();
-                }
-
-                aligned_free(d);
+                delete[] d->nodes;
+                delete d;
             }
         }
 
@@ -668,19 +643,23 @@ private:
                 return false;
             }
 
-            size_t size = sizeof(Node) * m_blockSize + sizeof(Block);
-            void* mem = aligned_malloc(size, 8);
-
-            if (mem == nullptr)
+            // Note: allocate nodes and block separately because alignment
+            // may not be the same.
+            Block* block = new (std::nothrow) Block;
+            if (block == nullptr)
             {
                 return false;
             }
-            
-            Block* block = new (mem) Block;
+
+            block->nodes = new (std::nothrow) Node[m_blockSize];
+            if (block->nodes == nullptr)
+            {
+                delete block;
+                return false;
+            }
 
             block->id = blockId;        
             block->next = nullptr;
-            block->nodes = new (block + 1) Node[m_blockSize];
 
             // Connect all the nodes in the new block. Element zero is
             // the "tail" of this block.
@@ -826,27 +805,6 @@ private:
     Node* to_node(_In_ const Address& address)
     {
         return m_heap.to_node(m_blockCache, address);
-    }
-    
-    static inline void* aligned_malloc(_In_ size_t size, _In_ size_t align)
-    {
-        void *result;
-        size_t bytes = (size + align - 1) & ~(align - 1);
-#ifdef _MSC_VER
-        result = _aligned_malloc(bytes, align);
-#else
-        if(posix_memalign(&result, align, bytes)) result = 0;
-#endif
-        return result;
-    }
-    
-    static inline void aligned_free(_In_ void *ptr)
-    {
-#ifdef _MSC_VER
-        _aligned_free(ptr);
-#else
-        free(ptr);
-#endif
     }
 };
 

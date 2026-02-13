@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation
-// Licensed under the MIT license. See LICENSE file in the project root for full license information.#include "stdafx.h"
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
 #include "pch.h"
 #include "referenced_ptr.h"
 #include "TaskQueueP.h"
@@ -7,12 +8,14 @@
 #include "XTaskQueuePriv.h"
 
 //
-// Note:  ApiDiag is only used for reference count validation during
-//        unit tests.  Otherwise, g_globalApiRefs is unused.
+// ApiRefs tracks global refcounts for all APIs. It is used to idenfity memory leaks
+// in tests and can be called to wait for all refs to be released.
 //
-namespace ApiDiag
+namespace ApiRefs
 {
-    std::atomic<uint32_t> g_globalApiRefs { 0 };
+    std::atomic<uint32_t> g_globalApiRefs{ 0 };
+    std::mutex g_waitMutex;
+    std::condition_variable g_waitCv;
     
     void GlobalAddRef()
     {
@@ -21,7 +24,27 @@ namespace ApiDiag
     
     void GlobalRelease()
     {
-        g_globalApiRefs--;
+        auto priorRefs = g_globalApiRefs.fetch_sub(1);
+        if (priorRefs == 1)
+        {
+            std::unique_lock<std::mutex> lock(g_waitMutex);
+            g_waitCv.notify_all();
+        }
+    }
+
+    bool WaitZeroRefs(_In_ uint32_t timeoutMilliseconds)
+    {
+        // We are called after queues are deleted so it could be
+        // possible that the cv doesn't get signaled, so check for
+        // zero first before waiting.
+        std::unique_lock<std::mutex> lock(g_waitMutex);
+        if (g_globalApiRefs.load() != 0)
+        {
+            g_waitCv.wait_for(lock, std::chrono::milliseconds(timeoutMilliseconds));
+            return g_globalApiRefs == 0;
+        }
+
+        return true;
     }
 }
 
@@ -647,7 +670,7 @@ bool TaskQueuePortImpl::DrainOneItem(
         m_processingCallbackCv.notify_all();
     }
 
-    if (m_queueList->empty())
+    if (m_queueList->empty() && m_processingCallback.load() == 0)
     {
         SignalTerminations();
         SignalQueue();
@@ -1090,21 +1113,21 @@ void TaskQueuePortImpl::SubmitPendingCallback()
 // Called from thread pool callback
 void TaskQueuePortImpl::ProcessThreadPoolCallback(_In_ OS::ThreadPoolActionStatus& status)
 {
-    uint32_t wasProcessing = m_processingCallback++;
     if (m_dispatchMode == XTaskQueueDispatchMode::SerializedThreadPool)
     {
+        uint32_t wasProcessing = m_processingSerializedTbCallback++;
+
         if (wasProcessing == 0)
         {
             while (DrainOneItem(status));
         }
+
+        m_processingSerializedTbCallback--;
     }
     else
     {
         DrainOneItem(status);
     }
-
-    m_processingCallback--;
-    m_processingCallbackCv.notify_all();
 
     // Important that this comes before Release; otherwise
     // cleanup may deadlock.
@@ -1418,14 +1441,11 @@ TaskQueueImpl::TaskQueueImpl() :
     Api(),
     m_callbackSubmitted(&m_header),
     m_work(this, XTaskQueuePort::Work, &m_callbackSubmitted),
-    m_completion(this, XTaskQueuePort::Completion, &m_callbackSubmitted),
-    m_allowClose(true)
+    m_completion(this, XTaskQueuePort::Completion, &m_callbackSubmitted)
 {
     m_header.m_signature = TASK_QUEUE_SIGNATURE;
     m_header.m_runtimeIteration = GetCurrentRuntimeIteration();
     m_header.m_queue = this;
-
-    m_termination.allowed = true;
     m_termination.terminated = false;
 }
 
@@ -1438,13 +1458,8 @@ TaskQueueImpl::~TaskQueueImpl()
 
 HRESULT TaskQueueImpl::Initialize(
     _In_ XTaskQueueDispatchMode workMode,
-    _In_ XTaskQueueDispatchMode completionMode,
-    _In_ bool allowTermination,
-    _In_ bool allowClose)
+    _In_ XTaskQueueDispatchMode completionMode)
 {
-    m_termination.allowed = allowTermination;
-    m_allowClose = allowClose;
-
     referenced_ptr<TaskQueuePortImpl> work(new (std::nothrow) TaskQueuePortImpl);
     RETURN_IF_NULL_ALLOC(work);
     RETURN_IF_FAILED(work->Initialize(workMode));
@@ -1461,14 +1476,6 @@ HRESULT TaskQueueImpl::Initialize(
 
     RETURN_IF_FAILED(m_work.Port->Attach(&m_work));
     RETURN_IF_FAILED(m_completion.Port->Attach(&m_completion));
-
-    if (!allowClose)
-    {
-        // This queue will never be closed.  Subtract off the
-        // global api refs so tests don't think there's a leak.  We
-        // need to subtract off our own ref and the refs of each of our ports.
-        ApiDiag::g_globalApiRefs -= 3;
-    }
 
 #ifdef SUSPEND_API
     RETURN_IF_FAILED(m_suspendHandler.Initialize(ProcessGlobals::g_suspendState, this));
@@ -1488,9 +1495,6 @@ HRESULT TaskQueueImpl::Initialize(
     m_completion.Port = referenced_ptr<ITaskQueuePort>(completionPort->m_port);
     m_work.Source = referenced_ptr<ITaskQueue>(workPort->m_queue);
     m_completion.Source = referenced_ptr<ITaskQueue>(completionPort->m_queue);
-
-    m_termination.allowed = true;
-    m_allowClose = true;
     
     RETURN_IF_FAILED(m_work.Port->Attach(&m_work));
     RETURN_IF_FAILED(m_completion.Port->Attach(&m_completion));
@@ -1585,23 +1589,11 @@ void __stdcall TaskQueueImpl::UnregisterSubmitCallback(
     m_callbackSubmitted.Unregister(token);
 }
 
-bool __stdcall TaskQueueImpl::CanTerminate()
-{
-    return m_termination.allowed;
-}
-
-bool __stdcall TaskQueueImpl::CanClose()
-{
-    return m_allowClose;
-}
-
 HRESULT __stdcall TaskQueueImpl::Terminate(
     _In_ bool wait, 
     _In_opt_ void* callbackContext, 
     _In_opt_ XTaskQueueTerminatedCallback* callback)
 {
-    RETURN_HR_IF(E_ACCESSDENIED, !m_termination.allowed);
-
     std::unique_ptr<TerminationEntry> entry(new (std::nothrow) TerminationEntry);
     RETURN_IF_NULL_ALLOC(entry);
 
@@ -1739,8 +1731,6 @@ static HRESULT CreateTaskQueueHandle(
 {
     *queue = nullptr;
 
-    ASSERT(impl->CanClose());
-
     std::unique_ptr<XTaskQueueObject> q(new (std::nothrow) XTaskQueueObject);
     RETURN_IF_NULL_ALLOC(q);
 
@@ -1776,9 +1766,7 @@ STDAPI XTaskQueueCreate(
 
     RETURN_IF_FAILED(aq->Initialize(
         workDispatchMode, 
-        completionDispatchMode, 
-        true, /* can terminate */ 
-        true /* can close */));
+        completionDispatchMode));
 
     RETURN_IF_FAILED(CreateTaskQueueHandle(aq.get(), queue));
 
@@ -1897,7 +1885,7 @@ STDAPI_(void) XTaskQueueCloseHandle(
 {
     ITaskQueue* aq = GetQueue(queue);
 
-    if (aq != nullptr && aq->CanClose())
+    if (aq != nullptr)
     {
         if (USE_UNIQUE_HANDLES() && queue != aq->GetHandle())
         {
@@ -2015,24 +2003,14 @@ STDAPI XTaskQueueDuplicateHandleWithOptions(
     auto queue = GetQueue(queueHandle);
     RETURN_HR_IF(E_GAMERUNTIME_INVALID_HANDLE, queue == nullptr);
 
-    // For queues that cannot be closed we return the default
-    // handle provided by the queue.
-
-    if (queue->CanClose())
+    if (USE_UNIQUE_HANDLES() && (options != XTaskQueueDuplicateOptions::Reference))
     {
-        if (USE_UNIQUE_HANDLES() && (options != XTaskQueueDuplicateOptions::Reference))
-        {
-            RETURN_IF_FAILED(CreateTaskQueueHandle(queue, duplicatedHandle));
-        }
-        else
-        {
-            queue->AddRef();
-            *duplicatedHandle = queue->GetHandle();
-        }
+        RETURN_IF_FAILED(CreateTaskQueueHandle(queue, duplicatedHandle));
     }
     else
     {
-        *duplicatedHandle = queueHandle;
+        queue->AddRef();
+        *duplicatedHandle = queue->GetHandle();
     }
 
     return S_OK;
@@ -2104,15 +2082,13 @@ STDAPI_(bool) XTaskQueueGetCurrentProcessTaskQueueWithOptions(
         XTaskQueueHandle defaultProcessQueue = ProcessGlobals::g_defaultProcessQueue;
         if (defaultProcessQueue == ProcessGlobals::g_invalidQueueHandle)
         {
-            // The default process queue hasn't been created yet.  Create it locally
+            // The default process queue hasn't been created yet. Create it locally
             // then swap it into the atomic.
 
             referenced_ptr<TaskQueueImpl> aq(new (std::nothrow) TaskQueueImpl);
             if (aq != nullptr && SUCCEEDED(aq->Initialize(
                 XTaskQueueDispatchMode::ThreadPool,
-                XTaskQueueDispatchMode::ThreadPool,
-                false, /* can terminate */
-                false /* can close */)))
+                XTaskQueueDispatchMode::ThreadPool)))
             {
                 XTaskQueueHandle expected = ProcessGlobals::g_invalidQueueHandle;
                 if (ProcessGlobals::g_defaultProcessQueue.compare_exchange_strong(
@@ -2125,13 +2101,6 @@ STDAPI_(bool) XTaskQueueGetCurrentProcessTaskQueueWithOptions(
             }
 
             defaultProcessQueue = ProcessGlobals::g_defaultProcessQueue;
-        }
-        else
-        {
-            // The default process task queue never terminates and survives
-            // a re-init of the runtime. Ensure the handle's runtime iteration
-            // matches the current iteration.
-            defaultProcessQueue->m_runtimeIteration = GetCurrentRuntimeIteration();
         }
 
         processQueue = defaultProcessQueue;
@@ -2237,7 +2206,8 @@ STDAPI_(void) XTaskQueueResumeTermination(
 //    is empty).
 //
 #ifdef SUSPEND_API
-STDAPI_(void) XTaskQueueGlobalSuspend()
+STDAPI_(void) XTaskQueueGlobalSuspend(
+    ) noexcept
 {
     ProcessGlobals::g_suspendState.Suspend();
     ProcessGlobals::g_suspendState.WaitForQueuesToSuspend();
@@ -2252,8 +2222,46 @@ STDAPI_(void) XTaskQueueGlobalSuspend()
 // 2. The dispatcher will start returing items again.
 //
 #ifdef SUSPEND_API
-STDAPI_(void) XTaskQueueGlobalResume()
+STDAPI_(void) XTaskQueueGlobalResume(
+    ) noexcept
 {
     ProcessGlobals::g_suspendState.Resume();
 }
 #endif
+
+//
+// Uninitializes global task queue state. This closes handles to per-process
+// task queues and resets state back to defaults. If there is a per-process
+// task queue, it will be closed but not terminated.  Queue termination is
+// up to the caller. This API returns true if all task queues have been
+// cleaned up and deleted, or false if there are still outstanding references.
+// A timeout may be provided to wait for outstanding queues to be cleaned up.
+// The default is not to wait. The maximum timeout capped to 5000ms.
+//
+STDAPI_(bool) XTaskQueueUninitialize(
+    _In_ uint32_t timeoutMilliseconds
+    ) noexcept
+{
+    std::atomic<XTaskQueueHandle>* globals[] =
+    {
+        &ProcessGlobals::g_defaultProcessQueue,
+        &ProcessGlobals::g_processQueue
+    };
+
+    for (auto queue : globals)
+    {
+        auto handle = queue->exchange(ProcessGlobals::g_invalidQueueHandle);
+        if (handle != nullptr && handle != ProcessGlobals::g_invalidQueueHandle)
+        {
+            XTaskQueueCloseHandle(handle);
+        }
+    }
+
+    constexpr uint32_t maxTimeout = 5000;
+    if (timeoutMilliseconds > maxTimeout)
+    {
+        timeoutMilliseconds = maxTimeout;
+    }
+
+    return ApiRefs::WaitZeroRefs(timeoutMilliseconds);
+}
