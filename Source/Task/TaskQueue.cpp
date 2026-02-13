@@ -495,7 +495,10 @@ HRESULT __stdcall TaskQueuePortImpl::PrepareTerminate(
     std::unique_ptr<TerminationEntry> term(new (std::nothrow) TerminationEntry);
     RETURN_IF_NULL_ALLOC(term);
 
-    RETURN_HR_IF(E_OUTOFMEMORY, !m_terminationList->reserve_node(term->node));
+    {
+        std::lock_guard<std::mutex> lock(m_terminationLock);
+        RETURN_HR_IF(E_OUTOFMEMORY, !m_terminationList->reserve_node(term->node));
+    }
 
     term->callbackContext = callbackContext;
     term->callback = callback;
@@ -517,6 +520,7 @@ void __stdcall TaskQueuePortImpl::CancelTermination(
 
     if (term->node != 0)
     {
+        std::lock_guard<std::mutex> lock(m_terminationLock);
         m_terminationList->free_node(term->node);
     }
 
@@ -542,6 +546,7 @@ void __stdcall TaskQueuePortImpl::Terminate(
     }
     else
     {
+        std::lock_guard<std::mutex> lock(m_terminationLock);
         m_pendingTerminationList->push_back(term, term->node);
         term->node = 0;
     }
@@ -664,7 +669,7 @@ bool TaskQueuePortImpl::Wait(
     _In_ uint32_t timeout)
 {
 #ifdef _WIN32
-    while (m_suspended || (m_queueList->empty() && m_terminationList->empty()))
+    while (m_suspended || (m_queueList->empty() && TerminationListEmpty()))
     {
         if (portContext->GetStatus() == TaskQueuePortStatus::Terminated)
         {
@@ -726,7 +731,7 @@ bool TaskQueuePortImpl::Wait(
     }
 
 #else
-    while (m_suspended || (m_queueList->empty() && m_terminationList->empty()))
+    while (m_suspended || (m_queueList->empty() && TerminationListEmpty()))
     {
         if (portContext->GetStatus() == TaskQueuePortStatus::Terminated)
         {
@@ -802,20 +807,31 @@ void __stdcall TaskQueuePortImpl::ResumeTermination(
     {
         // Removed the last external callback.  Look for
         // parked terminations and reschedule them.
-
-        m_pendingTerminationList->remove_if([&](auto& entry, auto address)
+        // Use a temporary list sharing the same heap to avoid allocation
+        LocklessQueue<TerminationEntry*> entries_to_schedule(*m_pendingTerminationList.get());
+        
         {
-            if (entry->portContext == portContext)
+            std::lock_guard<std::mutex> lock(m_terminationLock);
+            m_pendingTerminationList->remove_if([&](auto& entry, auto address)
             {
-                // This entry is for the port that's resuming,
-                // we can schedule it.
-                entry->node = address;
-                ScheduleTermination(entry);
-                return true;
-            }
+                if (entry->portContext == portContext)
+                {
+                    entries_to_schedule.push_back(entry, address);
+                    return true;
+                }
 
-            return false;
-        });
+                return false;
+            });
+        }
+
+        // Schedule entries outside the lock
+        TerminationEntry* entry;
+        uint64_t address;
+        while (entries_to_schedule.pop_front(entry, address))
+        {
+            entry->node = address;
+            ScheduleTermination(entry);
+        }
     }
 }
 
@@ -849,18 +865,21 @@ void __stdcall TaskQueuePortImpl::ResumePort()
         m_queueList->push_back(std::move(queueEntry), address);
     }
 
-    TerminationEntry* terminationEntry;
-    LocklessQueue<TerminationEntry*> retainTerminations(*(m_terminationList.get()));
-
-    while (m_terminationList->pop_front(terminationEntry, address))
     {
-        notifyCount++;
-        retainTerminations.push_back(std::move(terminationEntry), address);
-    }
+        std::lock_guard<std::mutex> lock(m_terminationLock);
+        TerminationEntry* terminationEntry;
+        LocklessQueue<TerminationEntry*> retainTerminations(*(m_terminationList.get()));
 
-    while (retainTerminations.pop_front(terminationEntry, address))
-    {
-        m_terminationList->push_back(std::move(terminationEntry), address);
+        while (m_terminationList->pop_front(terminationEntry, address))
+        {
+            notifyCount++;
+            retainTerminations.push_back(std::move(terminationEntry), address);
+        }
+
+        while (retainTerminations.pop_front(terminationEntry, address))
+        {
+            m_terminationList->push_back(std::move(terminationEntry), address);
+        }
     }
 
     m_suspended = false;
@@ -1176,19 +1195,39 @@ void TaskQueuePortImpl::NotifyItemQueued()
 
 void TaskQueuePortImpl::SignalTerminations()
 {
-    m_terminationList->remove_if([this](auto& entry, auto address)
-    {
-        if (entry->portContext->GetStatus() >= TaskQueuePortStatus::Terminating)
-        {
-            entry->portContext->SetStatus(TaskQueuePortStatus::Terminated);
-            entry->callback(entry->callbackContext);
-            m_terminationList->free_node(address);
-            delete entry;
-            return true;
-        }
+    // Collect entries to process outside the iteration to avoid concurrent modification races
+    // when callbacks invoke nested Terminate() calls.
+    // Use a temporary list sharing the same heap to avoid allocation.
+    LocklessQueue<TerminationEntry*> entries_to_process(*m_terminationList.get());
 
-        return false;
-    });
+    {
+        std::lock_guard<std::mutex> lock(m_terminationLock);
+        m_terminationList->remove_if([this, &entries_to_process](auto& entry, auto address)
+        {
+            if (entry->portContext->GetStatus() >= TaskQueuePortStatus::Terminating)
+            {
+                entry->portContext->SetStatus(TaskQueuePortStatus::Terminated);
+                entries_to_process.push_back(entry, address);
+                return true;
+            }
+
+            return false;
+        });
+    }
+
+    // Now process callbacks outside the remove_if iteration
+    // This prevents races when callbacks invoke nested operations like Terminate()
+    TerminationEntry* entry;
+    uint64_t address;
+    while (entries_to_process.pop_front(entry, address))
+    {
+        entry->callback(entry->callbackContext);
+        {
+            std::lock_guard<std::mutex> lock(m_terminationLock);
+            m_terminationList->free_node(address);
+        }
+        delete entry;
+    }
 }
 
 void TaskQueuePortImpl::ScheduleTermination(
@@ -1202,8 +1241,11 @@ void TaskQueuePortImpl::ScheduleTermination(
 
     // This never fails because we preallocate the
     // list node.
-    m_terminationList->push_back(term, term->node);
-    term->node = 0; // now owned by the list
+    {
+        std::lock_guard<std::mutex> lock(m_terminationLock);
+        m_terminationList->push_back(term, term->node);
+        term->node = 0; // now owned by the list
+    }
 
     // The port should have already been marked as terminated, so now
     // we can signal it to wake up. This should drain pending calls and
@@ -1211,6 +1253,12 @@ void TaskQueuePortImpl::ScheduleTermination(
 
     SignalQueue();
     NotifyItemQueued();
+}
+
+bool TaskQueuePortImpl::TerminationListEmpty()
+{
+    std::lock_guard<std::mutex> lock(m_terminationLock);
+    return m_terminationList->empty();
 }
 
 #ifdef _WIN32
